@@ -1,0 +1,227 @@
+{
+  "StartAt": "ParallelTask",
+  "States": {
+    "ParallelTask": {
+      "Type": "Parallel",
+      "ResultPath": "$.output",
+      "Next": "Output Transformer",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Fail"
+        }
+      ],
+      "Branches": [
+        {
+          "StartAt": "Verify Payment Details",
+          "States": {
+            "Verify Payment Details": {
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ClientExecutionTimeoutException",
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2
+                }
+              ],
+              "Type": "Task",
+              "OutputPath": "$.Payload",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:{REGION}:{ACCOUNT}:function:OrderProcessingWorkflowCd-PaymentVerifierCDK7E1DEA-IBglVqZ7xCXG",
+                "Payload.$": "$"
+              }
+            }
+          }
+        },
+        {
+          "StartAt": "Retrieve Item Stock Levels",
+          "States": {
+            "Retrieve Item Stock Levels": {
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ClientExecutionTimeoutException",
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2
+                }
+              ],
+              "Type": "Task",
+              "OutputPath": "$.Payload",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:{REGION}:{ACCOUNT}:function:OrderProcessingWorkflowCd-ItemsInStockRetrieverCDK-RGYHaPovbltM",
+                "Payload": {
+                  "items.$": "$.orderContents.items"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "ResultSelector": {
+        "paymentVerified.$": "$[0].paymentVerified",
+        "items.$": "$[1]"
+      }
+    },
+    "Output Transformer": {
+      "Type": "Pass",
+      "Parameters": {
+        "items.$": "$.output.items",
+        "orderTotal.$": "$.orderTotal",
+        "customerId.$": "$.customerId",
+        "paymentDetails.$": "$.paymentDetails",
+        "paymentVerified.$": "$.output.paymentVerified"
+      },
+      "Next": "Validate quantity of items > 0"
+    },
+    "Validate quantity of items > 0": {
+      "Type": "Map",
+      "ResultPath": null,
+      "Next": "Charge Customer",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Fail"
+        }
+      ],
+      "Iterator": {
+        "StartAt": "Item in stock or not?",
+        "States": {
+          "Item in stock or not?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.quantityInStock",
+                "NumericEquals": 0,
+                "Next": "Item not in stock"
+              }
+            ],
+            "Default": "Pass placeholder"
+          },
+          "Pass placeholder": {
+            "Type": "Pass",
+            "End": true
+          },
+          "Item not in stock": {
+            "Type": "Fail"
+          }
+        }
+      },
+      "ItemsPath": "$.items",
+      "MaxConcurrency": 1
+    },
+    "Charge Customer": {
+      "Next": "Create order with state PAYMENT_PROCESSED",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ClientExecutionTimeoutException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "PaymentError"
+          ],
+          "ResultPath": "$.output",
+          "Next": "Create order with state PAYMENT_FAILED"
+        }
+      ],
+      "Type": "Task",
+      "ResultPath": "$.output",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:{REGION}:{ACCOUNT}:function:OrderProcessingWorkflowCd-ChargePaymentMethodCDKC7-Ucs1QOoCibbk",
+        "Payload.$": "$"
+      }
+    },
+    "Create order with state PAYMENT_PROCESSED": {
+      "Next": "Publish to interested parties",
+      "Type": "Task",
+      "ResultPath": null,
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "Item": {
+          "OrderId": {
+            "S.$": "States.UUID()"
+          },
+          "State": {
+            "S": "PAYMENT_PROCESSED"
+          },
+          "CustomerId": {
+            "S.$": "$.customerId"
+          },
+          "OrderTotal": {
+            "N.$": "States.Format('{}', $.orderTotal)"
+          },
+          "Items": {
+            "S.$": "States.JsonToString($.items)"
+          }
+        },
+        "TableName": "CustomerOrders_CDK"
+      }
+    },
+    "Publish to interested parties": {
+      "End": true,
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:{REGION}:{ACCOUNT}:OrderProcessingWorkflowCdkStack-OrderUpdatesCDKD76B36D6-9zysK2aIfc2l",
+        "Message.$": "$"
+      }
+    },
+    "Create order with state PAYMENT_FAILED": {
+      "Next": "Publish to interested parties",
+      "Type": "Task",
+      "ResultPath": null,
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "Item": {
+          "OrderId": {
+            "S.$": "States.UUID()"
+          },
+          "State": {
+            "S": "PAYMENT_FAILED"
+          },
+          "CustomerId": {
+            "S.$": "$.customerId"
+          },
+          "OrderTotal": {
+            "N.$": "States.Format('{}', $.orderTotal)"
+          },
+          "Items": {
+            "S.$": "States.JsonToString($.items)"
+          }
+        },
+        "TableName": "CustomerOrders_CDK"
+      }
+    },
+    "Fail": {
+      "Type": "Fail"
+    }
+  }
+}
